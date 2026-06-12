@@ -16,13 +16,16 @@ are talking to. That is what makes a posted "half" usable as a cross-chat
 account identifier.
 
 This script:
-  1. Pulls your groups (with members) and your known identities from signal-cli
-     (or from JSON files you dump yourself).
+  1. Pulls your groups (with members), your known identities, and your contacts
+     from signal-cli (or from JSON files you dump yourself).
   2. Auto-detects YOUR half -- the 30-digit block common to all your safety
      numbers -- so we can subtract it out. (Override with --my-half if needed.)
   3. For each group member whose identity key signal-cli already knows, extracts
      THEIR half and compares it to your watchlist.
-  4. Reports matches, the watchlist entries that never matched, and coverage gaps.
+  4. Reports matches, resolving each to a human label (profile name / username /
+     number) plus the rename-proof ACI, and prints a ready-to-run removal command.
+     With --remove, it can remove (and optionally --ban) matched members from
+     groups your linked account administers.
 
 IMPORTANT CAVEATS (please actually read)
 ----------------------------------------
@@ -62,6 +65,7 @@ the grouped form. Blank lines and lines starting with # are skipped.
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -114,13 +118,24 @@ def _launch_hint(launcher):
     return "Install signal-cli, pass --signal-cli /path/to/signal-cli, or use --flatpak."
 
 
-def run_signal_cli(account, command_args, launcher):
+def run_signal_cli(account, command_args, launcher, soft=False):
+    """Run a signal-cli command and return parsed JSON.
+
+    With soft=True, failures return None (and warn) instead of exiting, for
+    optional calls like listContacts.
+    """
     cmd = launcher + ["-a", account, "--output=json"] + command_args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
+        if soft:
+            return None
         sys.exit(f"Could not run '{launcher[0]}'. {_launch_hint(launcher)}")
     if proc.returncode != 0:
+        if soft:
+            sys.stderr.write(f"warning: signal-cli {' '.join(command_args)} failed; "
+                             f"continuing without it.\n")
+            return None
         sys.exit(f"signal-cli failed ({' '.join(command_args)}):\n{proc.stderr.strip()}")
     out = proc.stdout.strip()
     if not out:
@@ -128,6 +143,8 @@ def run_signal_cli(account, command_args, launcher):
     try:
         return json.loads(out)
     except json.JSONDecodeError:
+        if soft:
+            return None
         sys.exit(f"Could not parse signal-cli JSON for: {' '.join(command_args)}\n"
                  f"First 400 chars:\n{out[:400]}")
 
@@ -174,6 +191,79 @@ def normalize_groups(raw):
             "members": members,
         })
     return groups
+
+
+# ---------- name resolution (so a match shows a human-recognizable label) ----------
+
+def normalize_contacts(raw):
+    """From listContacts JSON, pull number/uuid/username/profile name per account."""
+    out = []
+    for item in raw or []:
+        profile = item.get("profile") or {}
+        given = _first(profile, "givenName", "given_name", default="")
+        family = _first(profile, "familyName", "lastName", "family_name", default="")
+        profile_name = " ".join(p for p in (given, family) if p).strip()
+        out.append({
+            "number": _first(item, "number"),
+            "uuid": _first(item, "uuid", "serviceId", "aci"),
+            "username": _first(item, "username", default=""),
+            "contact_name": _first(item, "name", "nickname", default=""),
+            "profile_name": profile_name,
+        })
+    return out
+
+
+def build_name_map(contacts):
+    m = {}
+    for c in contacts:
+        if c["uuid"]:
+            m[c["uuid"]] = c
+        if c["number"]:
+            m.setdefault(c["number"], c)
+    return m
+
+
+def describe_member(member, name_map):
+    """Resolve a member's ACI to a human label plus all known locators."""
+    aci = member.get("uuid") or ""
+    number = member.get("number") or ""
+    info = name_map.get(aci) or name_map.get(number) or {}
+    profile_name = info.get("profile_name", "")
+    contact_name = info.get("contact_name", "")
+    username = info.get("username", "")
+    number = number or info.get("number", "") or ""
+    display_name = profile_name or contact_name or "(no profile name received -- run --receive)"
+    return {
+        "aci": aci,
+        "number": number,
+        "username": username,
+        "profile_name": profile_name,
+        "contact_name": contact_name,
+        "display_name": display_name,
+    }
+
+
+def removal_command(launcher, account, group_id, recipient, ban=False):
+    parts = launcher + ["-a", account, "updateGroup", "-g", group_id,
+                        "--remove-member", recipient]
+    if ban:
+        parts += ["--ban", recipient]
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def remove_member(launcher, account, group_id, recipient, ban=False):
+    """Remove (and optionally ban) a member. Returns (ok, message)."""
+    cmd = launcher + ["-a", account, "updateGroup", "-g", group_id,
+                      "--remove-member", recipient]
+    if ban:
+        cmd += ["--ban", recipient]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, f"could not run '{launcher[0]}'"
+    if proc.returncode == 0:
+        return True, (proc.stdout.strip() or "ok")
+    return False, (proc.stderr.strip() or proc.stdout.strip() or "unknown error")
 
 
 # ---------- core logic ----------
@@ -256,8 +346,17 @@ def main():
     ap.add_argument("--my-half", help="override auto-detection of your own 30-digit half")
     ap.add_argument("--identities-json", help="read listIdentities JSON from a file instead")
     ap.add_argument("--groups-json", help="read listGroups -d JSON from a file instead")
+    ap.add_argument("--contacts-json",
+                    help="read listContacts JSON from a file (for name resolution in file mode)")
     ap.add_argument("--receive", action="store_true",
-                    help="run 'signal-cli receive' first to refresh known identities")
+                    help="run 'signal-cli receive' first to refresh identities and profiles")
+    ap.add_argument("--remove", action="store_true",
+                    help="offer to remove each matched member from its group "
+                         "(linked account must be a group admin)")
+    ap.add_argument("--ban", action="store_true",
+                    help="with --remove, also ban the member from rejoining via link")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --remove, skip the per-member confirmation prompt (DANGEROUS)")
     ap.add_argument("--report-json", help="also write a machine-readable report to this path")
     args = ap.parse_args()
 
@@ -284,6 +383,15 @@ def main():
         raw_grp = run_signal_cli(args.account, ["listGroups", "-d"], launcher)
     groups = normalize_groups(raw_grp)
 
+    # contacts -> name map (optional; failure is non-fatal)
+    if args.contacts_json:
+        raw_contacts = json.load(open(args.contacts_json, encoding="utf-8"))
+    elif using_cli:
+        raw_contacts = run_signal_cli(args.account, ["listContacts"], launcher, soft=True) or []
+    else:
+        raw_contacts = []
+    name_map = build_name_map(normalize_contacts(raw_contacts))
+
     watchlist, problems = load_watchlist(args.watchlist)
     if not watchlist:
         sys.exit("Watchlist contained no usable 30-digit halves.")
@@ -298,7 +406,7 @@ def main():
         if idn["number"]:
             by_number[idn["number"]] = idn["safety_number"]
 
-    hits = defaultdict(list)     # matched half -> [(group, member_id)]
+    hits = defaultdict(list)     # matched half -> [ {group, group_id, member} ]
     unresolved = []              # (group, member_id) with no known identity
     anomalies = []               # (group, member_id) where our half wasn't present
     total_members = resolved = 0
@@ -321,7 +429,21 @@ def main():
                 anomalies.append((g["name"], mid))
                 continue
             if th in watchlist:
-                hits[th].append((g["name"], mid))
+                hits[th].append({"group": g["name"], "group_id": g.get("id"), "member": m})
+
+    # Build enriched match records once, reused for console + removal + JSON.
+    match_records = []
+    for half, locations in hits.items():
+        recs = []
+        for loc in locations:
+            d = describe_member(loc["member"], name_map)
+            recipient = d["aci"] or d["number"]
+            cmd = (removal_command(launcher, args.account, loc["group_id"], recipient, args.ban)
+                   if (args.account and loc["group_id"] and recipient) else None)
+            recs.append({"group": loc["group"], "group_id": loc["group_id"],
+                         "remove_command": cmd, **d})
+        match_records.append({"half": watchlist[half], "locations": recs})
+
 
     # ---- print report ----
     line = "=" * 72
@@ -336,13 +458,23 @@ def main():
           f"{len(unresolved)} unresolved.")
     print(line)
 
-    if hits:
-        print(f"\n*** {sum(len(v) for v in hits.values())} MATCH(ES) ACROSS "
-              f"{len(hits)} WATCHLIST ENTRY/ENTRIES ***\n")
-        for half, locations in hits.items():
-            print(f"[MATCH] watchlist half {watchlist[half]}")
-            for gname, mid in locations:
-                print(f"        in group: {gname!r}   member: {mid}")
+    if match_records:
+        total_hits = sum(len(r["locations"]) for r in match_records)
+        print(f"\n*** {total_hits} MATCH(ES) ACROSS "
+              f"{len(match_records)} WATCHLIST ENTRY/ENTRIES ***\n")
+        for rec in match_records:
+            print(f"[MATCH] watchlist half {rec['half']}")
+            for loc in rec["locations"]:
+                extras = ""
+                if loc["username"]:
+                    extras += f"   username: {loc['username']}"
+                if loc["number"]:
+                    extras += f"   number: {loc['number']}"
+                print(f"        group : {loc['group']!r}")
+                print(f"        member: {loc['display_name']}{extras}")
+                print(f"        aci   : {loc['aci']}   (rename-proof id; ground truth)")
+                if loc["remove_command"]:
+                    print(f"        remove: {loc['remove_command']}")
             print()
     else:
         print("\nNo watchlist halves matched any resolvable group member.")
@@ -383,6 +515,53 @@ def main():
           "time has passed.")
     print(line)
 
+    # ---- optional removal ----
+    removals = []
+    if args.remove and match_records:
+        print()
+        print(line)
+        print("REMOVAL  (the linked account must be an ADMIN of each group)")
+        print("A match confirms the identity KEY, not intent -- verify before removing.")
+        print(line)
+        if not args.account:
+            print("Cannot remove in file-input mode (no -a/--account). "
+                  "Use the printed 'remove:' commands manually.")
+        elif not args.yes and not sys.stdin.isatty():
+            print("Refusing to remove non-interactively without --yes. Re-run with --yes "
+                  "to confirm, or use the printed 'remove:' commands manually.")
+        else:
+            removed = failed = skipped = 0
+            for rec in match_records:
+                for loc in rec["locations"]:
+                    recipient = loc["aci"] or loc["number"]
+                    target = f"{loc['display_name']} (aci {loc['aci']}) from {loc['group']!r}"
+                    if not loc["group_id"] or not recipient:
+                        print(f"  cannot remove (missing group id or recipient): {target}")
+                        failed += 1
+                        continue
+                    if not args.yes:
+                        try:
+                            ans = input(f"Remove {target}? [y/N] ").strip().lower()
+                        except EOFError:
+                            ans = "n"
+                        if ans not in ("y", "yes"):
+                            print("  skipped.")
+                            skipped += 1
+                            continue
+                    ok, msg = remove_member(launcher, args.account, loc["group_id"],
+                                            recipient, args.ban)
+                    status = "removed" + (" + banned" if args.ban else "")
+                    removals.append({"target": target, "ok": ok, "message": msg,
+                                     "banned": bool(args.ban)})
+                    if ok:
+                        print(f"  {status}: {target}")
+                        removed += 1
+                    else:
+                        print(f"  FAILED: {target}\n    {msg}")
+                        failed += 1
+            print(f"\nRemoval summary: {removed} removed, {failed} failed, {skipped} skipped.")
+        print(line)
+
     if args.report_json:
         report = {
             "my_half": my_half,
@@ -391,22 +570,19 @@ def main():
             "groups_scanned": len(groups),
             "members_total": total_members,
             "members_resolved": resolved,
-            "matches": [
-                {"half": watchlist[h], "locations": [{"group": g, "member": m}
-                                                     for g, m in locs]}
-                for h, locs in hits.items()
-            ],
+            "matches": match_records,
             "watchlist_unmatched": unmatched,
             "unresolved_members": [{"group": g, "member": m} for g, m in unresolved],
             "anomalies": [{"group": g, "member": m} for g, m in anomalies],
             "skipped_watchlist_lines": [{"line": ln, "reason": why} for ln, _, why in problems],
+            "removals": removals,
         }
         with open(args.report_json, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2)
         print(f"\nMachine-readable report written to {args.report_json}")
 
     # exit non-zero if anything matched, so it's pipeline-friendly
-    sys.exit(1 if hits else 0)
+    sys.exit(1 if match_records else 0)
 
 
 if __name__ == "__main__":
