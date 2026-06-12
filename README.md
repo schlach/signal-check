@@ -91,7 +91,7 @@ do not need to build anything.
 ### Java (all platforms)
 
 Install a JRE/JDK 21+ if you don't have one. [Eclipse Temurin / Adoptium](https://adoptium.net)
-provides builds for every platform. Verify with:
+provides builds for every platform, or install from e.g. https://jdk.java.net/26/ . Verify with:
 
 ```
 java -version
@@ -129,14 +129,16 @@ brew install signal-cli   # pulls in a suitable Java automatically
 
 ### Windows
 
-1. Install a JRE 21+ (Temurin from Adoptium).
-2. Download the latest release archive from the
+1. Install a JRE 21+ (e.g. from https://jdk.java.net/26) 
+2. Make sure that JAVA_HOME points to it. If you unzipped java to c:\jdk-26.0.1, then from a command line, run "set JAVA_HOME=c:\jdk-26.0.1" 
+3. Download the latest release archive of signal-cli from the
    [releases page](https://github.com/AsamK/signal-cli/releases) and unpack it,
    e.g. to `C:\signal-cli`.
-3. Run it from the `bin` folder using the batch launcher:
+3. Run it from main folder using the batch launcher:
 
 ```bat
-C:\signal-cli\bin\signal-cli.bat --version
+cd C:\signal-cli
+bin\signal-cli.bat --version
 ```
 
 Alternatively, install [WSL2](https://learn.microsoft.com/windows/wsl/) and
