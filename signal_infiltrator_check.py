@@ -46,6 +46,10 @@ USAGE
   # Straight through signal-cli:
   ./signal_infiltrator_check.py watchlist.txt -a +15551234567 --receive
 
+  # Via the hardened Flatpak (signal-cli runs in its sandbox; this script stays
+  # on the host and only reads its stdout, so the sandbox needs no file access):
+  ./signal_infiltrator_check.py watchlist.txt -a +15551234567 --flatpak --receive
+
   # Or dump the JSON yourself and feed it in (useful if the account dir is busy):
   signal-cli -a +1555... --output=json listIdentities  > ids.json
   signal-cli -a +1555... --output=json listGroups -d   > grps.json
@@ -90,12 +94,32 @@ def split_halves(safety_number):
 
 # ---------- signal-cli I/O ----------
 
-def run_signal_cli(account, command_args, signal_cli_bin="signal-cli"):
-    cmd = [signal_cli_bin, "-a", account, "--output=json"] + command_args
+def build_launcher(args):
+    """Return the command prefix used to invoke signal-cli.
+
+    Host binary:  ["signal-cli"]              (or whatever --signal-cli points at)
+    Flatpak:      ["flatpak", "run", APP_ID]  (everything after APP_ID is passed
+                                               straight through to signal-cli)
+    """
+    if args.flatpak:
+        return ["flatpak", "run", args.flatpak_app]
+    return [args.signal_cli]
+
+
+def _launch_hint(launcher):
+    if launcher[:2] == ["flatpak", "run"]:
+        app = launcher[2] if len(launcher) > 2 else "org.asamk.SignalCli"
+        return ("Is flatpak installed and the app present?  Try:\n"
+                f"  flatpak install --user flathub {app}")
+    return "Install signal-cli, pass --signal-cli /path/to/signal-cli, or use --flatpak."
+
+
+def run_signal_cli(account, command_args, launcher):
+    cmd = launcher + ["-a", account, "--output=json"] + command_args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        sys.exit(f"Could not find '{signal_cli_bin}'. Install signal-cli or pass --signal-cli.")
+        sys.exit(f"Could not run '{launcher[0]}'. {_launch_hint(launcher)}")
     if proc.returncode != 0:
         sys.exit(f"signal-cli failed ({' '.join(command_args)}):\n{proc.stderr.strip()}")
     out = proc.stdout.strip()
@@ -108,12 +132,12 @@ def run_signal_cli(account, command_args, signal_cli_bin="signal-cli"):
                  f"First 400 chars:\n{out[:400]}")
 
 
-def signal_cli_receive(account, signal_cli_bin="signal-cli", timeout=10):
-    cmd = [signal_cli_bin, "-a", account, "receive", "-t", str(timeout)]
+def signal_cli_receive(account, launcher, timeout=10):
+    cmd = launcher + ["-a", account, "receive", "-t", str(timeout)]
     try:
         subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        sys.exit(f"Could not find '{signal_cli_bin}'.")
+        sys.exit(f"Could not run '{launcher[0]}'. {_launch_hint(launcher)}")
 
 
 # ---------- normalization (tolerant to field-name drift across versions) ----------
@@ -225,6 +249,10 @@ def main():
     ap.add_argument("watchlist", help="file with one 30-digit safety-number half per line")
     ap.add_argument("-a", "--account", help="your signal-cli account, e.g. +15551234567")
     ap.add_argument("--signal-cli", default="signal-cli", help="path to signal-cli binary")
+    ap.add_argument("--flatpak", action="store_true",
+                    help="invoke signal-cli via 'flatpak run' instead of a host binary")
+    ap.add_argument("--flatpak-app", default="org.asamk.SignalCli",
+                    help="flatpak application id (used with --flatpak)")
     ap.add_argument("--my-half", help="override auto-detection of your own 30-digit half")
     ap.add_argument("--identities-json", help="read listIdentities JSON from a file instead")
     ap.add_argument("--groups-json", help="read listGroups -d JSON from a file instead")
@@ -237,21 +265,23 @@ def main():
     if using_cli and not args.account:
         sys.exit("Provide -a/--account (or supply both --identities-json and --groups-json).")
 
+    launcher = build_launcher(args)
+
     if args.receive and using_cli:
-        signal_cli_receive(args.account, args.signal_cli)
+        signal_cli_receive(args.account, launcher)
 
     # identities
     if args.identities_json:
         raw_idn = json.load(open(args.identities_json, encoding="utf-8"))
     else:
-        raw_idn = run_signal_cli(args.account, ["listIdentities"], args.signal_cli)
+        raw_idn = run_signal_cli(args.account, ["listIdentities"], launcher)
     identities = normalize_identities(raw_idn)
 
     # groups
     if args.groups_json:
         raw_grp = json.load(open(args.groups_json, encoding="utf-8"))
     else:
-        raw_grp = run_signal_cli(args.account, ["listGroups", "-d"], args.signal_cli)
+        raw_grp = run_signal_cli(args.account, ["listGroups", "-d"], launcher)
     groups = normalize_groups(raw_grp)
 
     watchlist, problems = load_watchlist(args.watchlist)
