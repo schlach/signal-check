@@ -13,15 +13,43 @@ or phone-number change won't evade it.
 
 ---
 
+## Quick start
+
+```bash
+git clone https://github.com/schlach/signal-check.git
+cd signal-check
+
+# 1. Install signal-cli (see "Installing signal-cli") and link the account whose
+#    groups you want to check -- approve the QR from Signal -> Linked Devices:
+signal-cli -a +15551234567 link -n audit
+
+# 2. Put one 30-digit safety-number half per line in watchlist.txt, then scan:
+python3 signal_infiltrator_check.py watchlist.txt -a +15551234567 --receive
+
+# 3. Review the matches, then (as a group admin) remove, with a y/N prompt each:
+python3 signal_infiltrator_check.py watchlist.txt -a +15551234567 --receive --remove
+```
+
+Running the hardened Flatpak on Linux? Add `--flatpak` to every command, and link
+with `flatpak run org.asamk.SignalCli -a +1555... link -n audit`. The full install
+options, the security model, and the caveats are below — read them before acting
+on a match.
+
+---
+
 ## What it does — and what it doesn't
 
 **It does:**
 
-- Pull your groups (with members) and known identities from
+- Pull your groups (with members), known identities, and contacts from
   [`signal-cli`](https://github.com/AsamK/signal-cli).
 - Auto-detect *your* half of each safety number and subtract it out.
 - Compare every resolvable group member's half against a watchlist you supply.
-- Report matches, the watchlist entries that never matched, and coverage gaps.
+- Report matches — resolving each to a human label (profile name / username /
+  number) plus the rename-proof ACI — and print a ready-to-run removal command.
+- Optionally **remove** (and `--ban`) matched members from groups your linked
+  account administers.
+- Report the watchlist entries that never matched, and coverage gaps.
 
 **It does not:**
 
@@ -229,29 +257,92 @@ py signal_infiltrator_check.py watchlist.txt -a +15551234567 ^
 
 ### Cross-platform fallback (no subprocess at all)
 
-Run signal-cli yourself to dump the two JSON files, then feed them in. This
-behaves identically on every platform and sidesteps the Windows `.bat` issue and
-any locked-account-directory problems:
+Run signal-cli yourself to dump the JSON files, then feed them in. This behaves
+identically on every platform and sidesteps the Windows `.bat` issue and any
+locked-account-directory problems:
 
 ```bash
 signal-cli -a +15551234567 --output=json listIdentities > ids.json
 signal-cli -a +15551234567 --output=json listGroups -d  > grps.json
+signal-cli -a +15551234567 --output=json listContacts   > contacts.json   # optional: for names
 
 python3 signal_infiltrator_check.py watchlist.txt \
-    --identities-json ids.json --groups-json grps.json
+    --identities-json ids.json --groups-json grps.json --contacts-json contacts.json
 ```
+
+The `listContacts` dump and `--contacts-json` are **only needed in this file-input
+mode**, and only if you want matches labelled with profile names. In normal live
+mode (with `-a/--account`), the script fetches contacts automatically, so you
+never pass `--contacts-json` there. Omit it in file mode and matches still work —
+members just show a `(no profile name received)` placeholder beside the ACI and
+removal command.
+
+---
+
+## Removing matched members
+
+Each match prints a human label, the rename-proof ACI, and a ready-to-run
+removal command. When the same account turns up in more than one group, each is
+listed separately (blank line between them):
+
+```
+[MATCH] watchlist half 99900 00000 00000 00000 00000 00777
+        group : 'Cleveland Defense'
+        member: Teddy Bridges   username: teddy.42   number: +15550000003
+        aci   : 8d1a…   (rename-proof id; ground truth)
+        remove: signal-cli -a +15551234567 updateGroup -g Z2lk… --remove-member 8d1a…
+
+        group : 'Statewide Table'
+        member: Teddy Bridges   username: teddy.42   number: +15550000003
+        aci   : 8d1a…   (rename-proof id; ground truth)
+        remove: signal-cli -a +15551234567 updateGroup -g aBcD… --remove-member 8d1a…
+```
+
+In the file-dump workflow (no `-a/--account`), the `remove:` line still prints
+with a `<YOUR_ACCOUNT>` placeholder you substitute before running it.
+
+Removal is keyed by the **ACI**, not a name, so it can't be dodged by the account
+renaming itself between your scan and your action. You can copy the `remove:`
+command, or let the script do it:
+
+```bash
+# prompt 'Remove <name>? [y/N]' for each match:
+./signal_infiltrator_check.py watchlist.txt -a +15551234567 --flatpak --receive --remove
+
+# also ban (blocks rejoining via invite link):
+./signal_infiltrator_check.py watchlist.txt -a +15551234567 --flatpak --remove --ban
+
+# unattended (no prompts) — required for non-interactive use:
+./signal_infiltrator_check.py watchlist.txt -a +15551234567 --flatpak --remove --yes
+```
+
+Notes:
+
+- Your **linked account must be an admin** of a group to remove anyone from it.
+  Where it isn't, signal-cli returns an error and the script reports `FAILED`
+  rather than silently skipping.
+- Name resolution needs members' profiles, which you get by running `--receive`
+  first; in shared groups profile keys are exchanged, so names usually resolve.
+- `--remove` prompts per match. It **refuses to act non-interactively** (piped or
+  no TTY) unless you pass `--yes`, to prevent accidental scripted removals.
+- A match confirms the **identity key, not intent**, and the original
+  identification can be wrong. The tool prints this reminder right before
+  removing. Verify before you act.
 
 ---
 
 ## Output and exit codes
 
-The tool prints a human-readable report: the matches and where they were found,
-the watchlist entries with no match, members whose identity key it couldn't
-resolve (blind spots, **not** cleared), and any skipped watchlist lines.
+The tool prints a human-readable report: each match (with resolved name,
+username, number, ACI, and a removal command), the watchlist entries with no
+match, members whose identity key it couldn't resolve (blind spots, **not**
+cleared), and any skipped watchlist lines.
 
 - Exit code **1** if one or more matches were found (pipeline-friendly).
 - Exit code **0** if none matched.
-- `--report-json PATH` additionally writes a machine-readable report.
+- `--report-json PATH` additionally writes a machine-readable report, including
+  resolved member details, the removal command per match, and the result of any
+  removals performed.
 
 ---
 
@@ -265,9 +356,13 @@ resolve (blind spots, **not** cleared), and any skipped watchlist lines.
 | `--flatpak-app` | Flatpak application id (default `org.asamk.SignalCli`). |
 | `--signal-cli` | Path to the signal-cli binary (or `.bat` on Windows). |
 | `--my-half` | Override auto-detection of your own 30-digit half. |
-| `--receive` | Run `signal-cli receive` first to populate more identities. |
+| `--receive` | Run `signal-cli receive` first to refresh identities and profiles. |
+| `--remove` | Offer to remove each matched member from its group (linked account must be a group admin). |
+| `--ban` | With `--remove`, also ban the member from rejoining via invite link. |
+| `--yes` | With `--remove`, skip the per-member confirmation prompt (required for non-interactive use). |
 | `--identities-json` | Read `listIdentities` JSON from a file instead of calling signal-cli. |
 | `--groups-json` | Read `listGroups -d` JSON from a file instead of calling signal-cli. |
+| `--contacts-json` | Read `listContacts` JSON from a file (file-input mode only; for name resolution). |
 | `--report-json` | Also write a machine-readable report to this path. |
 
 ---
@@ -312,7 +407,7 @@ Please read these — they determine how much a result is worth.
 
 ## License
 
-MIT License. Provided as-is, with no warranty.
+MIT licensed. Provided as-is, with no warranty.
 
 Use it only on groups you belong to or administer, and remember that the output
 is investigative input, not an accusation.

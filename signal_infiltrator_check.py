@@ -186,7 +186,7 @@ def normalize_groups(raw):
     for g in raw:
         members = [normalize_member(m) for m in (_first(g, "members", default=[]) or [])]
         groups.append({
-            "id": _first(g, "id", "groupId"),
+            "id": _first(g, "id", "groupId", "group_id", "internalId"),
             "name": _first(g, "name", default="(unnamed group)"),
             "members": members,
         })
@@ -244,10 +244,14 @@ def describe_member(member, name_map):
 
 
 def removal_command(launcher, account, group_id, recipient, ban=False):
-    parts = launcher + ["-a", account, "updateGroup", "-g", group_id,
-                        "--remove-member", recipient]
+    """Render a copy-pasteable removal command, using clear placeholders for any
+    part we don't know (e.g. the account in file-input mode)."""
+    acct = account or "<YOUR_ACCOUNT>"
+    gid = group_id or "<GROUP_ID>"
+    rcpt = recipient or "<ACI>"
+    parts = launcher + ["-a", acct, "updateGroup", "-g", gid, "--remove-member", rcpt]
     if ban:
-        parts += ["--ban", recipient]
+        parts += ["--ban", rcpt]
     return " ".join(shlex.quote(p) for p in parts)
 
 
@@ -438,8 +442,7 @@ def main():
         for loc in locations:
             d = describe_member(loc["member"], name_map)
             recipient = d["aci"] or d["number"]
-            cmd = (removal_command(launcher, args.account, loc["group_id"], recipient, args.ban)
-                   if (args.account and loc["group_id"] and recipient) else None)
+            cmd = removal_command(launcher, args.account, loc["group_id"], recipient, args.ban)
             recs.append({"group": loc["group"], "group_id": loc["group_id"],
                          "remove_command": cmd, **d})
         match_records.append({"half": watchlist[half], "locations": recs})
@@ -473,9 +476,8 @@ def main():
                 print(f"        group : {loc['group']!r}")
                 print(f"        member: {loc['display_name']}{extras}")
                 print(f"        aci   : {loc['aci']}   (rename-proof id; ground truth)")
-                if loc["remove_command"]:
-                    print(f"        remove: {loc['remove_command']}")
-            print()
+                print(f"        remove: {loc['remove_command']}")
+                print()   # blank line between entries (same account may span groups)
     else:
         print("\nNo watchlist halves matched any resolvable group member.")
         print("(Remember: this is weak evidence of absence -- see caveats.)\n")
